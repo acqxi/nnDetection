@@ -19,6 +19,8 @@ from nndet.arch.encoder.abstract import EncoderType
 from nndet.arch.decoder.base import DecoderType
 from nndet.arch.heads.segmenter import SegmenterType
 from nndet.arch.heads.comb import HeadType
+from nndet.arch.heads.controller import ControllerType
+from nndet.arch.heads.mask import DynamicMaskHead
 from nndet.core.boxes.anchors import AnchorGeneratorType
 
 
@@ -41,9 +43,12 @@ class BaseRetinaNet(AbstractModel):
                  nms_thresh: float = 0.9,
                  # optional
                  segmenter: Optional[SegmenterType] = None,
+                 # CondInst components
+                 controller: Optional[ControllerType] = None,
+                 dynamic_mask_head: Optional[DynamicMaskHead] = None,
                  ):
         """
-        Base Retina(U)Net
+        Base Retina(U)Net with CondInst support
         Can be subclasses to add specific configurations to it
 
         Args:
@@ -61,6 +66,8 @@ class BaseRetinaNet(AbstractModel):
             remove_small_boxes: remove small bounding boxes
             nms_thresh: non maximum suppression threshold
             segmenter: segmentation module
+            controller: CondInst controller head for dynamic parameters
+            dynamic_mask_head: CondInst dynamic mask generation head
         """
         super().__init__()
         assert dim in [2, 3]
@@ -78,6 +85,14 @@ class BaseRetinaNet(AbstractModel):
         self.score_thresh = score_thresh
         self.topk_candidates = topk_candidates
         self.detections_per_img = detections_per_img
+        self.remove_small_boxes = remove_small_boxes
+        self.nms_thresh = nms_thresh
+
+        self.segmenter = segmenter
+        
+        # CondInst components
+        self.controller = controller
+        self.dynamic_mask_head = dynamic_mask_head
         self.remove_small_boxes = remove_small_boxes
         self.nms_thresh = nms_thresh
 
@@ -130,7 +145,7 @@ class BaseRetinaNet(AbstractModel):
         target_classes: List[Tensor] = targets["target_classes"]
         target_seg: Tensor = targets["target_seg"]
 
-        pred_detection, anchors, pred_seg = self(images)
+        pred_detection, anchors, pred_seg, pred_controller = self(images)
         labels, matched_gt_boxes = self.assign_targets_to_anchors(
             anchors, target_boxes, target_classes)
 
@@ -138,6 +153,44 @@ class BaseRetinaNet(AbstractModel):
         head_losses, pos_idx, neg_idx = self.head.compute_loss(
             pred_detection, labels, matched_gt_boxes, anchors)
         losses.update(head_losses)
+
+        # CondInst mask loss computation
+        if self.controller is not None and self.dynamic_mask_head is not None:
+            # Get positive samples' mask parameters from controller predictions
+            if isinstance(pred_controller, list):
+                # Concatenate predictions from all levels
+                all_mask_params = torch.cat(pred_controller, dim=1)
+            else:
+                all_mask_params = pred_controller
+            
+            # Extract positive samples based on pos_idx
+            pos_mask_params_list = []
+            start_idx = 0
+            for batch_idx, pos_indices in enumerate(pos_idx):
+                if len(pos_indices) > 0:
+                    # Get mask parameters for positive samples in this image
+                    batch_mask_params = all_mask_params[batch_idx]
+                    pos_mask_params = batch_mask_params[pos_indices]
+                    pos_mask_params_list.append(pos_mask_params)
+            
+            if pos_mask_params_list:
+                # Concatenate all positive mask parameters
+                pos_mask_params = torch.cat(pos_mask_params_list, dim=0)
+                
+                # Get highest resolution feature map (e.g., P3) for mask generation
+                features_maps_all = self.decoder.get_all_features()  # This method may need to be added
+                mask_features = features_maps_all[self.decoder_levels[0]]  # Use first level (highest resolution)
+                
+                # Generate predicted masks
+                pred_masks = self.dynamic_mask_head(mask_features, pos_mask_params)
+                
+                # Get target masks (this requires modification to data loading)
+                if "target_instance_masks" in targets:
+                    target_masks = targets["target_instance_masks"]
+                    
+                    # Compute mask loss
+                    mask_loss = self.dynamic_mask_head.compute_loss(pred_masks, target_masks)
+                    losses['mask_loss'] = mask_loss
 
         if self.segmenter is not None:
             losses.update(self.segmenter.compute_loss(pred_seg, target_seg))
@@ -147,6 +200,7 @@ class BaseRetinaNet(AbstractModel):
                 images=images,
                 pred_detection=pred_detection,
                 pred_seg=pred_seg,
+                pred_controller=pred_controller,
                 anchors=anchors,
             )
         else:
@@ -163,6 +217,7 @@ class BaseRetinaNet(AbstractModel):
                                   images: torch.Tensor,
                                   pred_detection: Dict[str, torch.Tensor],
                                   pred_seg: Dict[str, torch.Tensor],
+                                  pred_controller: Optional[Dict[str, torch.Tensor]],
                                   anchors: List[torch.Tensor],
                                   ) -> Dict[str, Union[List[Tensor], Tensor]]:
         """
@@ -172,6 +227,7 @@ class BaseRetinaNet(AbstractModel):
             images: input images
             pred_detection: detection predictions
             pred_seg: segmentation predictions
+            pred_controller: controller predictions for dynamic masks
             anchors: anchors
 
         Returns:
@@ -197,9 +253,9 @@ class BaseRetinaNet(AbstractModel):
 
     def forward(self,
                 inp: torch.Tensor,
-                ) -> Tuple[Dict[str, torch.Tensor], List[torch.Tensor], Dict[str, torch.Tensor]]:
+                ) -> Tuple[Dict[str, torch.Tensor], List[torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Compute predicted bounding boxes, scores and segmentations
+        Compute predicted bounding boxes, scores, segmentations and dynamic mask parameters
 
         Args:
             inp (torch.Tensor): batch of input images
@@ -215,6 +271,9 @@ class BaseRetinaNet(AbstractModel):
             dict: segmentation prediction. None if retina net is configured.
                 Typically includes:
                     `seg_logits`: segmentation logits
+            dict: controller prediction for dynamic masks. None if controller is not configured.
+                Typically includes:
+                    `mask_params`: dynamic convolution parameters
         """
         features_maps_all = self.decoder(self.encoder(inp))
         feature_maps_head = [features_maps_all[i] for i in self.decoder_levels]
@@ -223,7 +282,9 @@ class BaseRetinaNet(AbstractModel):
         anchors = self.anchor_generator(inp, feature_maps_head)
 
         pred_seg = self.segmenter(features_maps_all) if self.segmenter is not None else None
-        return pred_detection, anchors, pred_seg
+        pred_controller = self.controller(feature_maps_head) if self.controller is not None else None
+        
+        return pred_detection, anchors, pred_seg, pred_controller
 
     @torch.no_grad()
     def assign_targets_to_anchors(self,
@@ -404,11 +465,12 @@ class BaseRetinaNet(AbstractModel):
                 'pred_labels': List[Tensor]: predicted class List[[R]]
                 'pred_seg': Tensor: predicted segmentation [N, C, dims]
         """
-        pred_detection, anchors, pred_seg = self(images)
+        pred_detection, anchors, pred_seg, pred_controller = self(images)
         prediction = self.postprocess_for_inference(
             images=images,
             pred_detection=pred_detection,
             pred_seg=pred_seg,
+            pred_controller=pred_controller,
             anchors=anchors,
         )
         return prediction

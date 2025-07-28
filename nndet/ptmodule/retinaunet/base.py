@@ -51,6 +51,7 @@ from nndet.arch.heads.classifier import ClassifierType, CEClassifier
 from nndet.arch.heads.regressor import RegressorType, L1Regressor
 from nndet.arch.heads.comb import HeadType, DetectionHeadHNM
 from nndet.arch.heads.segmenter import SegmenterType, DiCESegmenter
+from nndet.arch.heads.controller import ControllerType
 
 from nndet.training.optimizer import get_params_no_wd_on_norm
 from nndet.training.learning_rate import LinearWarmupPolyLR
@@ -411,6 +412,25 @@ class RetinaUNetModule(LightningBaseModuleSWA):
             model_cfg=model_cfg,
             decoder=decoder,
         )
+        
+        # Build CondInst components if enabled
+        controller = None
+        dynamic_mask_head = None
+        if model_cfg.get("enable_condinst", False):
+            from nndet.arch.heads.controller import Controller
+            from nndet.arch.heads.mask import DynamicMaskHead
+            
+            controller = cls._build_head_controller(
+                plan_arch=plan_arch,
+                model_cfg=model_cfg,
+                anchor_generator=anchor_generator,
+            )
+            
+            dynamic_mask_head = DynamicMaskHead(
+                dim=plan_arch["dim"],
+                in_channels=plan_arch["fpn_channels"],
+                internal_channels=model_cfg.get("mask_head_internal_channels", 8),
+            )
 
         detections_per_img = plan_arch.get("detections_per_img", 100)
         score_thresh = plan_arch.get("score_thresh", 0)
@@ -436,6 +456,9 @@ class RetinaUNetModule(LightningBaseModuleSWA):
             num_classes=plan_arch["classifier_classes"],
             decoder_levels=plan_arch["decoder_levels"],
             segmenter=segmenter,
+            # CondInst components
+            controller=controller,
+            dynamic_mask_head=dynamic_mask_head,
             # model_max_instances_per_batch_element (in mdt per img, per class; here: per img)
             detections_per_img=detections_per_img,
             score_thresh=score_thresh,
@@ -646,6 +669,50 @@ class RetinaUNetModule(LightningBaseModuleSWA):
         else:
             segmenter = None
         return segmenter
+
+    @classmethod
+    def _build_head_controller(
+        cls,
+        plan_arch: dict,
+        model_cfg: dict,
+        anchor_generator: AnchorGeneratorType,
+    ) -> ControllerType:
+        """
+        Build controller head for CondInst dynamic mask parameters
+
+        Args:
+            plan_arch: architecture settings
+            model_cfg: additional architecture settings
+            anchor_generator: anchor generator
+
+        Returns:
+            ControllerType: controller instance
+        """
+        from nndet.arch.heads.controller import Controller
+        from nndet.arch.heads.mask import DynamicMaskHead
+        
+        conv = Generator(cls.head_conv_cls, plan_arch["dim"])
+        name = "Controller"
+        kwargs = model_cfg.get('head_controller_kwargs', {})
+        logger.info(f"Building:: controller {name}: {kwargs}")
+
+        # Calculate number of mask parameters needed
+        temp_mask_head = DynamicMaskHead(
+            dim=plan_arch["dim"], 
+            in_channels=plan_arch["fpn_channels"]
+        )
+        num_mask_params = temp_mask_head.num_mask_params
+
+        controller = Controller(
+            conv=conv,
+            in_channels=plan_arch["fpn_channels"],
+            internal_channels=plan_arch["head_channels"],
+            anchors_per_pos=anchor_generator.num_anchors_per_location()[0],
+            num_levels=len(plan_arch["decoder_levels"]),
+            num_mask_params=num_mask_params,
+            **kwargs,
+        )
+        return controller
 
     @staticmethod
     def get_ensembler_cls(key: Hashable, dim: int) -> Callable:
