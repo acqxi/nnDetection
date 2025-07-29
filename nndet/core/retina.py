@@ -3,9 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Parts of this code are from torchvision (https://github.com/pytorch/vision) licensed under
-# SPDX-FileCopyrightText: 2016 Soumith Chintala 
+# SPDX-FileCopyrightText: 2016 Soumith Chintala
 # SPDX-License-Identifier: BSD-3-Clause
-
 
 import torch
 import torch.nn as nn
@@ -25,28 +24,32 @@ from nndet.core.boxes.anchors import AnchorGeneratorType
 
 
 class BaseRetinaNet(AbstractModel):
-    def __init__(self,
-                 dim: int,
-                 # modules
-                 encoder: EncoderType,
-                 decoder: DecoderType,
-                 head: HeadType,
-                 num_classes: int,
-                 anchor_generator: AnchorGeneratorType,
-                 matcher: box_utils.MatcherType,
-                 decoder_levels: tuple = (2, 3, 4, 5),
-                 # post-processing
-                 score_thresh: float = None,
-                 detections_per_img: int = 100,
-                 topk_candidates: int = 10000,
-                 remove_small_boxes: float = 1e-2,
-                 nms_thresh: float = 0.9,
-                 # optional
-                 segmenter: Optional[SegmenterType] = None,
-                 # CondInst components
-                 controller: Optional[ControllerType] = None,
-                 dynamic_mask_head: Optional[DynamicMaskHead] = None,
-                 ):
+
+    def __init__(
+        self,
+        dim: int,
+        # modules
+        encoder: EncoderType,
+        decoder: DecoderType,
+        head: HeadType,
+        num_classes: int,
+        anchor_generator: AnchorGeneratorType,
+        matcher: box_utils.MatcherType,
+        decoder_levels: tuple = (2, 3, 4, 5),
+        # post-processing
+        score_thresh: float = None,
+        detections_per_img: int = 100,
+        topk_candidates: int = 10000,
+        remove_small_boxes: float = 1e-2,
+        nms_thresh: float = 0.9,
+        # optional
+        segmenter: Optional[SegmenterType] = None,
+        # CondInst components
+        controller: Optional[ControllerType] = None,
+        dynamic_mask_head: Optional[DynamicMaskHead] = None,
+        # Mask loss weight for dynamic masks
+        mask_loss_weight: float = 1.0,
+    ):
         """
         Base Retina(U)Net with CondInst support
         Can be subclasses to add specific configurations to it
@@ -89,7 +92,7 @@ class BaseRetinaNet(AbstractModel):
         self.nms_thresh = nms_thresh
 
         self.segmenter = segmenter
-        
+
         # CondInst components
         self.controller = controller
         self.dynamic_mask_head = dynamic_mask_head
@@ -98,13 +101,15 @@ class BaseRetinaNet(AbstractModel):
 
         self.segmenter = segmenter
 
-    def train_step(self,
-                   images: Tensor,
-                   targets: dict,
-                   evaluation: bool,
-                   batch_num: int,
-                   ) -> Tuple[
-            Dict[str, torch.Tensor], Optional[Dict]]:
+        self.mask_loss_weight = mask_loss_weight
+
+    def train_step(
+        self,
+        images: Tensor,
+        targets: dict,
+        evaluation: bool,
+        batch_num: int,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict]]:
         """
         Perform a single training step (forward pass + loss computation)
 
@@ -145,9 +150,11 @@ class BaseRetinaNet(AbstractModel):
         target_classes: List[Tensor] = targets["target_classes"]
         target_seg: Tensor = targets["target_seg"]
 
-        pred_detection, anchors, pred_seg, pred_controller = self(images)
-        labels, matched_gt_boxes = self.assign_targets_to_anchors(
-            anchors, target_boxes, target_classes)
+        pred_detection, anchors, pred_seg, pred_controller, features_maps_all = self(
+            images)
+
+        labels = targets['labels']
+        matched_gt_boxes = targets['boxes']
 
         losses = {}
         head_losses, pos_idx, neg_idx = self.head.compute_loss(
@@ -155,45 +162,35 @@ class BaseRetinaNet(AbstractModel):
         losses.update(head_losses)
 
         # CondInst mask loss computation
-        if self.controller is not None and self.dynamic_mask_head is not None:
-            # Get positive samples' mask parameters from controller predictions
-            if isinstance(pred_controller, list):
-                # Concatenate predictions from all levels
-                all_mask_params = torch.cat(pred_controller, dim=1)
-            else:
-                all_mask_params = pred_controller
-            
-            # Extract positive samples based on pos_idx
-            pos_mask_params_list = []
-            start_idx = 0
-            for batch_idx, pos_indices in enumerate(pos_idx):
-                if len(pos_indices) > 0:
-                    # Get mask parameters for positive samples in this image
-                    batch_mask_params = all_mask_params[batch_idx]
-                    pos_mask_params = batch_mask_params[pos_indices]
-                    pos_mask_params_list.append(pos_mask_params)
-            
-            if pos_mask_params_list:
-                # Concatenate all positive mask parameters
-                pos_mask_params = torch.cat(pos_mask_params_list, dim=0)
-                
-                # Get highest resolution feature map (e.g., P3) for mask generation
-                features_maps_all = self.decoder.get_all_features()  # This method may need to be added
-                mask_features = features_maps_all[self.decoder_levels[0]]  # Use first level (highest resolution)
-                
-                # Generate predicted masks
-                pred_masks = self.dynamic_mask_head(mask_features, pos_mask_params)
-                
-                # Get target masks (this requires modification to data loading)
-                if "target_instance_masks" in targets:
-                    target_masks = targets["target_instance_masks"]
-                    
-                    # Compute mask loss
-                    mask_loss = self.dynamic_mask_head.compute_loss(pred_masks, target_masks)
-                    losses['mask_loss'] = mask_loss
+        if 'mask_params' in pred_detection and self.dynamic_mask_head is not None:
+            pred_mask_params = pred_detection['mask_params']
+
+            # ✅ 關鍵修正 2: 直接從合併後的 targets 字典中獲取 'masks'
+            target_masks = targets.get("masks")
+
+            if pos_idx.numel() > 0 and target_masks is not None:
+                # 您的原始邏輯保持不變
+                pos_mask_params = pred_mask_params[pos_idx]
+                mask_features = features_maps_all[0]
+
+                # 您的原始邏輯保持不變
+                if mask_features.shape[2:] != target_masks.shape[2:]:
+                    target_masks = F.interpolate(
+                        target_masks.to(torch.float),
+                        size=mask_features.shape[2:],
+                        mode='trilinear' if self.dim == 3 else 'bilinear',
+                        align_corners=False).to(target_masks.dtype)
+
+                pred_masks = self.dynamic_mask_head(mask_features,
+                                                    pos_mask_params)
+                mask_loss = self.dynamic_mask_head.compute_loss(
+                    pred_masks, target_masks)
+                losses['mask_loss'] = mask_loss * self.mask_loss_weight
 
         if self.segmenter is not None:
-            losses.update(self.segmenter.compute_loss(pred_seg, target_seg))
+            seg_loss = self.segmenter.compute_loss(pred_seg,
+                                                   targets['instances'])
+            losses.update(seg_loss)
 
         if evaluation:
             prediction = self.postprocess_for_inference(
@@ -213,13 +210,14 @@ class BaseRetinaNet(AbstractModel):
         return losses, prediction
 
     @torch.no_grad()
-    def postprocess_for_inference(self,
-                                  images: torch.Tensor,
-                                  pred_detection: Dict[str, torch.Tensor],
-                                  pred_seg: Dict[str, torch.Tensor],
-                                  pred_controller: Optional[Dict[str, torch.Tensor]],
-                                  anchors: List[torch.Tensor],
-                                  ) -> Dict[str, Union[List[Tensor], Tensor]]:
+    def postprocess_for_inference(
+        self,
+        images: torch.Tensor,
+        pred_detection: Dict[str, torch.Tensor],
+        pred_seg: Dict[str, torch.Tensor],
+        pred_controller: Optional[Dict[str, torch.Tensor]],
+        anchors: List[torch.Tensor],
+    ) -> Dict[str, Union[List[Tensor], Tensor]]:
         """
         Postprocess predictions for inference
 
@@ -245,15 +243,22 @@ class BaseRetinaNet(AbstractModel):
             anchors=anchors,
             image_shapes=image_shapes,
         )
-        prediction = {"pred_boxes": boxes, "pred_scores": probs, "pred_labels": labels}
+        prediction = {
+            "pred_boxes": boxes,
+            "pred_scores": probs,
+            "pred_labels": labels
+        }
 
         if self.segmenter is not None:
-            prediction["pred_seg"] = self.segmenter.postprocess_for_inference(pred_seg)["pred_seg"]
+            prediction["pred_seg"] = self.segmenter.postprocess_for_inference(
+                pred_seg)["pred_seg"]
         return prediction
 
-    def forward(self,
-                inp: torch.Tensor,
-                ) -> Tuple[Dict[str, torch.Tensor], List[torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        inp: torch.Tensor,
+    ) -> Tuple[Dict[str, torch.Tensor], List[torch.Tensor], Dict[
+            str, torch.Tensor], Dict[str, torch.Tensor], List[torch.Tensor]]:
         """
         Compute predicted bounding boxes, scores, segmentations and dynamic mask parameters
 
@@ -281,17 +286,18 @@ class BaseRetinaNet(AbstractModel):
         pred_detection = self.head(feature_maps_head)
         anchors = self.anchor_generator(inp, feature_maps_head)
 
-        pred_seg = self.segmenter(features_maps_all) if self.segmenter is not None else None
-        pred_controller = self.controller(feature_maps_head) if self.controller is not None else None
-        
-        return pred_detection, anchors, pred_seg, pred_controller
+        pred_seg = self.segmenter(
+            features_maps_all) if self.segmenter is not None else None
+        pred_controller = self.controller(
+            feature_maps_head) if self.controller is not None else None
+
+        return pred_detection, anchors, pred_seg, pred_controller, features_maps_all
 
     @torch.no_grad()
-    def assign_targets_to_anchors(self,
-                                  anchors: List[torch.Tensor],
-                                  target_boxes: List[torch.Tensor],
-                                  target_classes: List[torch.Tensor]) -> Tuple[
-                                      List[torch.Tensor], List[torch.Tensor]]:
+    def assign_targets_to_anchors(
+        self, anchors: List[torch.Tensor], target_boxes: List[torch.Tensor],
+        target_classes: List[torch.Tensor]
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Compute labels and matched ground truth for each anchor
         Adapted from torchvision https://github.com/pytorch/vision
@@ -314,29 +320,37 @@ class BaseRetinaNet(AbstractModel):
         """
         labels = []
         matched_gt_boxes = []
-        for anchors_per_image, gt_boxes, gt_classes in zip(anchors, target_boxes, target_classes):
+        for anchors_per_image, gt_boxes, gt_classes in zip(
+                anchors, target_boxes, target_classes):
             # indices of ground truth box for each proposal
             match_quality_matrix, matched_idxs = self.proposal_matcher(
-                gt_boxes, anchors_per_image,
-                num_anchors_per_level=self.anchor_generator.get_num_acnhors_per_level(),
-                num_anchors_per_loc=self.anchor_generator.num_anchors_per_location()[0])
+                gt_boxes,
+                anchors_per_image,
+                num_anchors_per_level=self.anchor_generator.
+                get_num_acnhors_per_level(),
+                num_anchors_per_loc=self.anchor_generator.
+                num_anchors_per_location()[0])
 
             # get the targets corresponding GT for each proposal
             # NB: need to clamp the indices because we can have a single
             # GT in the image, and matched_idxs can be -2, which goes
             # out of bounds
             if match_quality_matrix.numel() > 0:
-                matched_gt_boxes_per_image = gt_boxes[matched_idxs.clamp(min=0)]
+                matched_gt_boxes_per_image = gt_boxes[matched_idxs.clamp(
+                    min=0)]
 
                 # Positive (negative indices can be ignored because they are overwritten in the next step)
                 # this influences how background class is handled in the input!!!! (here +1 for background)
-                labels_per_image = gt_classes[matched_idxs.clamp(min=0)].to(dtype=anchors_per_image.dtype)
+                labels_per_image = gt_classes[matched_idxs.clamp(min=0)].to(
+                    dtype=anchors_per_image.dtype)
                 labels_per_image = labels_per_image + 1
             else:
                 num_anchors_per_image = anchors_per_image.shape[0]
                 # no ground truth => no matches, all background
-                matched_gt_boxes_per_image = torch.zeros_like(anchors_per_image)
-                labels_per_image = torch.zeros(num_anchors_per_image).to(anchors_per_image)
+                matched_gt_boxes_per_image = torch.zeros_like(
+                    anchors_per_image)
+                labels_per_image = torch.zeros(num_anchors_per_image).to(
+                    anchors_per_image)
 
             # Background (negative examples)
             bg_indices = matched_idxs == self.proposal_matcher.BELOW_LOW_THRESHOLD
@@ -350,11 +364,12 @@ class BaseRetinaNet(AbstractModel):
             matched_gt_boxes.append(matched_gt_boxes_per_image)
         return labels, matched_gt_boxes
 
-    def postprocess_detections(self,
-                               pred_detection: Dict[str, Tensor],
-                               anchors: List[Tensor],
-                               image_shapes: List[Tuple[int]],
-                               ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
+    def postprocess_detections(
+        self,
+        pred_detection: Dict[str, Tensor],
+        anchors: List[Tensor],
+        image_shapes: List[Tuple[int]],
+    ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
         """
         Postprocess bounding box deltas and logits to generate final boxes and
         scores
@@ -374,8 +389,10 @@ class BaseRetinaNet(AbstractModel):
             List[Tensor]: final class label [R]
         """
         boxes_per_image = [len(boxes_in_image) for boxes_in_image in anchors]
-        pred_detection = self.head.postprocess_for_inference(pred_detection, anchors)
-        pred_boxes, pred_probs = pred_detection["pred_boxes"], pred_detection["pred_probs"]
+        pred_detection = self.head.postprocess_for_inference(
+            pred_detection, anchors)
+        pred_boxes, pred_probs = pred_detection["pred_boxes"], pred_detection[
+            "pred_probs"]
 
         # split boxes and scores per image
         pred_boxes = pred_boxes.split(boxes_per_image, 0)
@@ -383,19 +400,21 @@ class BaseRetinaNet(AbstractModel):
 
         all_boxes, all_probs, all_labels = [], [], []
         # iterate over images
-        for boxes, probs, image_shape in zip(pred_boxes, pred_probs, image_shapes):
-            boxes, probs, labels = self.postprocess_detections_single_image(boxes, probs, image_shape)
+        for boxes, probs, image_shape in zip(pred_boxes, pred_probs,
+                                             image_shapes):
+            boxes, probs, labels = self.postprocess_detections_single_image(
+                boxes, probs, image_shape)
             all_boxes.append(boxes)
             all_probs.append(probs)
             all_labels.append(labels)
         return all_boxes, all_probs, all_labels
 
     def postprocess_detections_single_image(
-        self, 
-        boxes: Tensor, 
+        self,
+        boxes: Tensor,
         probs: Tensor,
         image_shape: Tuple[int],
-        ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Postprocess bounding box deltas and probabilities for a single image
         Adapted from torchvision https://github.com/pytorch/vision
@@ -425,16 +444,19 @@ class BaseRetinaNet(AbstractModel):
             keep_idxs = probs > self.score_thresh
             probs, idx = probs[keep_idxs], idx[keep_idxs]
 
-        anchor_idxs = torch.div(idx, self.num_foreground_classes, rounding_mode="floor")
+        anchor_idxs = torch.div(idx,
+                                self.num_foreground_classes,
+                                rounding_mode="floor")
         labels = idx % self.num_foreground_classes
         boxes = boxes[anchor_idxs]
 
         if self.remove_small_boxes is not None:
-            keep = box_utils.remove_small_boxes(boxes, min_size=self.remove_small_boxes)
+            keep = box_utils.remove_small_boxes(
+                boxes, min_size=self.remove_small_boxes)
             boxes, probs, labels = boxes[keep], probs[keep], labels[keep]
 
         keep = box_utils.batched_nms(boxes, probs, labels, self.nms_thresh)
-        
+
         if self.detections_per_img is not None:
             keep = keep[:self.detections_per_img]
         return boxes[keep], probs[keep], labels[keep]
@@ -446,10 +468,11 @@ class BaseRetinaNet(AbstractModel):
     #                        to_device(kwargs, device="cpu", detach=True))
 
     @torch.no_grad()
-    def inference_step(self,
-                       images: Tensor,
-                       **kwargs,
-                       ) -> Dict[str, Any]:
+    def inference_step(
+        self,
+        images: Tensor,
+        **kwargs,
+    ) -> Dict[str, Any]:
         """
         Perform inference for a batch of images
 

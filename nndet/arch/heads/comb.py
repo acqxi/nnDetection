@@ -25,6 +25,7 @@ from nndet.core.boxes import BoxCoderND
 from nndet.core.boxes.sampler import AbstractSampler
 from nndet.arch.heads.classifier import Classifier
 from nndet.arch.heads.regressor import Regressor
+from nndet.arch.heads.controller import Controller
 
 
 class AbstractHead(nn.Module):
@@ -32,6 +33,7 @@ class AbstractHead(nn.Module):
     Provides an abstract interface for an module which takes
     inputs and computed its own loss
     """
+
     @abstractmethod
     def forward(self, x: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -40,7 +42,7 @@ class AbstractHead(nn.Module):
         Args
             x: feature maps
         """
-        raise NotImplementedError 
+        raise NotImplementedError
 
     @abstractmethod
     def compute_loss(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
@@ -50,10 +52,12 @@ class AbstractHead(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def postprocess_for_inference(self,
-                                  prediction: Dict[str, torch.Tensor],
-                                  *args, **kwargs,
-                                  ) -> Dict[str, torch.Tensor]:
+    def postprocess_for_inference(
+        self,
+        prediction: Dict[str, torch.Tensor],
+        *args,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
         """
         Postprocess predictions for inference e.g. ocnvert logits to probs
 
@@ -65,11 +69,13 @@ class AbstractHead(nn.Module):
 
 
 class DetectionHead(AbstractHead):
-    def __init__(self,
-                 classifier: Classifier,
-                 regressor: Regressor,
-                 coder: BoxCoderND,
-                 ):
+
+    def __init__(
+        self,
+        classifier: Classifier,
+        regressor: Regressor,
+        coder: BoxCoderND,
+    ):
         """
         Detection head with classifier and regression module
         
@@ -82,9 +88,10 @@ class DetectionHead(AbstractHead):
         self.regressor = regressor
         self.coder = coder
 
-    def forward(self,
-                fmaps: List[torch.Tensor],
-                ) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        fmaps: List[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
         """
         Forward feature maps through head modules
 
@@ -97,24 +104,36 @@ class DetectionHead(AbstractHead):
                     [Num_Anchors_Batch, (dim * 2)]
                 `box_logits`(Tensor): classification logits
                     [Num_Anchors_Batch, (num_classes)]
+                `mask_params`(Tensor): mask parameters (if controller exists)
+                    [Num_Anchors_Batch, (num_mask_params)]
         """
-        logits, offsets = [], []
+        logits, offsets, mask_params = [], [], []
         for level, p in enumerate(fmaps):
             logits.append(self.classifier(p, level=level))
             offsets.append(self.regressor(p, level=level))
+            if hasattr(self, 'controller') and self.controller is not None:
+                mask_params.append(self.controller(p, level=level))
 
         sdim = fmaps[0].ndim - 2
         box_deltas = torch.cat(offsets, dim=1).reshape(-1, sdim * 2)
         box_logits = torch.cat(logits, dim=1).flatten(0, -2)
-        return {"box_deltas": box_deltas, "box_logits": box_logits}
+
+        # 組裝返回的字典
+        results = {"box_deltas": box_deltas, "box_logits": box_logits}
+        if mask_params:
+            num_p = mask_params[0].shape[-1]
+            mask_params_cat = torch.cat(mask_params, dim=1).reshape(-1, num_p)
+            results["mask_params"] = mask_params_cat
+        return results
 
     @abstractmethod
-    def compute_loss(self,
-                     prediction: Dict[str, Tensor],
-                     target_labels: List[Tensor],
-                     matched_gt_boxes: List[Tensor],
-                     anchors: List[Tensor],
-                     ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
+    def compute_loss(
+        self,
+        prediction: Dict[str, Tensor],
+        target_labels: List[Tensor],
+        matched_gt_boxes: List[Tensor],
+        anchors: List[Tensor],
+    ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
         """
         Compute regression and classification loss
         N anchors over all images; M anchors per image => sum(M) = N
@@ -137,10 +156,11 @@ class DetectionHead(AbstractHead):
         """
         raise NotImplementedError
 
-    def postprocess_for_inference(self,
-                                  prediction: Dict[str, torch.Tensor],
-                                  anchors: List[torch.Tensor],
-                                  ) -> Dict[str, torch.Tensor]:
+    def postprocess_for_inference(
+        self,
+        prediction: Dict[str, torch.Tensor],
+        anchors: List[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
         """
         Postprocess predictions for inference e.g. ocnvert logits to probs
 
@@ -152,20 +172,25 @@ class DetectionHead(AbstractHead):
             List[torch.Tensor]: anchors per image
         """
         postprocess_predictions = {
-            "pred_boxes": self.coder.decode(prediction["box_deltas"], anchors),
-            "pred_probs": self.classifier.box_logits_to_probs(prediction["box_logits"]),
+            "pred_boxes":
+            self.coder.decode(prediction["box_deltas"], anchors),
+            "pred_probs":
+            self.classifier.box_logits_to_probs(prediction["box_logits"]),
         }
         return postprocess_predictions
 
 
 class DetectionHeadHNM(DetectionHead):
-    def __init__(self,
-                 classifier: Classifier,
-                 regressor: Regressor,
-                 coder: BoxCoderND,
-                 sampler: AbstractSampler,
-                 log_num_anchors: Optional[str] = "mllogger",
-                 ):
+
+    def __init__(
+        self,
+        classifier: Classifier,
+        regressor: Regressor,
+        coder: BoxCoderND,
+        sampler: AbstractSampler,
+        controller: Optional[Controller] = None,
+        log_num_anchors: Optional[str] = "mllogger",
+    ):
         """
         Detection head with classifier and regression module. Uses hard negative
         example mining to compute loss
@@ -175,20 +200,25 @@ class DetectionHeadHNM(DetectionHead):
             regressor: regression module
             sampler (AbstractSampler): sampler for select positive and
                 negative examples
+            controller: optional controller module for mask parameters
             log_num_anchors (str): name of logger to use; if None, no logging
                 will be performed
         """
-        super().__init__(classifier=classifier, regressor=regressor, coder=coder)
+        super().__init__(classifier=classifier,
+                         regressor=regressor,
+                         coder=coder)
 
-        self.logger = None # get_logger(log_num_anchors) if log_num_anchors is not None else None
+        self.logger = None  # get_logger(log_num_anchors) if log_num_anchors is not None else None
         self.fg_bg_sampler = sampler
+        self.controller = controller
 
-    def compute_loss(self,
-                     prediction: Dict[str, Tensor],
-                     target_labels: List[Tensor],
-                     matched_gt_boxes: List[Tensor],
-                     anchors: List[Tensor],
-                     ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
+    def compute_loss(
+        self,
+        prediction: Dict[str, Tensor],
+        target_labels: List[Tensor],
+        matched_gt_boxes: List[Tensor],
+        anchors: List[Tensor],
+    ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
         """
         Compute regression and classification loss
         N anchors over all images; M anchors per image => sum(M) = N
@@ -211,10 +241,12 @@ class DetectionHeadHNM(DetectionHead):
             Tensor: sampled positive indices of anchors (after concatenation)
             Tensor: sampled negative indices of anchors (after concatenation)
         """
-        box_logits, box_deltas = prediction["box_logits"], prediction["box_deltas"]
+        box_logits, box_deltas = prediction["box_logits"], prediction[
+            "box_deltas"]
 
         losses = {}
-        sampled_pos_inds, sampled_neg_inds = self.select_indices(target_labels, box_logits)
+        sampled_pos_inds, sampled_neg_inds = self.select_indices(
+            target_labels, box_logits)
         sampled_inds = torch.cat([sampled_pos_inds, sampled_neg_inds], dim=0)
 
         target_labels = torch.cat(target_labels, dim=0)
@@ -223,7 +255,8 @@ class DetectionHeadHNM(DetectionHead):
             batch_matched_gt_boxes = torch.cat(matched_gt_boxes, dim=0)
             batch_anchors = torch.cat(anchors, dim=0)
             target_deltas_sampled = self.coder.encode_single(
-                batch_matched_gt_boxes[sampled_pos_inds], batch_anchors[sampled_pos_inds],
+                batch_matched_gt_boxes[sampled_pos_inds],
+                batch_anchors[sampled_pos_inds],
             )
 
         # target_deltas = self.coder.encode(matched_gt_boxes, anchors)
@@ -238,16 +271,17 @@ class DetectionHeadHNM(DetectionHead):
             losses["reg"] = self.regressor.compute_loss(
                 box_deltas[sampled_pos_inds],
                 target_deltas_sampled,
-                ) / max(1, sampled_pos_inds.numel())
+            ) / max(1, sampled_pos_inds.numel())
 
         losses["cls"] = self.classifier.compute_loss(
             box_logits[sampled_inds], target_labels[sampled_inds])
         return losses, sampled_pos_inds, sampled_neg_inds
 
-    def select_indices(self,
-                       target_labels: List[Tensor],
-                       boxes_scores: Tensor,
-                       ) -> Tuple[Tensor, Tensor]:
+    def select_indices(
+        self,
+        target_labels: List[Tensor],
+        boxes_scores: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
         """
         Sample positive and negative anchors from target labels
 
@@ -262,10 +296,12 @@ class DetectionHeadHNM(DetectionHead):
             Tensor: sampled negative indices [R]
         """
         boxes_max_fg_probs = self.classifier.box_logits_to_probs(boxes_scores)
-        boxes_max_fg_probs = boxes_max_fg_probs.max(dim=1)[0]  # search max of fg probs
+        boxes_max_fg_probs = boxes_max_fg_probs.max(
+            dim=1)[0]  # search max of fg probs
 
         # positive and negative anchor indices per image
-        sampled_pos_inds, sampled_neg_inds = self.fg_bg_sampler(target_labels, boxes_max_fg_probs)
+        sampled_pos_inds, sampled_neg_inds = self.fg_bg_sampler(
+            target_labels, boxes_max_fg_probs)
         sampled_pos_inds = torch.where(torch.cat(sampled_pos_inds, dim=0))[0]
         sampled_neg_inds = torch.where(torch.cat(sampled_neg_inds, dim=0))[0]
 
@@ -277,13 +313,13 @@ class DetectionHeadHNM(DetectionHead):
 
 
 class BoxHeadNoSampler(DetectionHead):
+
     def __init__(self,
                  classifier: Classifier,
                  regressor: Regressor,
                  coder: BoxCoderND,
                  log_num_anchors: Optional[str] = "mllogger",
-                 **kwargs
-                 ):
+                 **kwargs):
         """
         Detection head with classifier and regression module. Uses all
         foreground anchors for regression an passes all anchors to classifier
@@ -294,15 +330,18 @@ class BoxHeadNoSampler(DetectionHead):
             log_num_anchors (str): name of logger to use; if None, no
                 logging will be performed
         """
-        super().__init__(classifier=classifier, regressor=regressor, coder=coder)
-        self.logger = None # get_logger(log_num_anchors) if log_num_anchors is not None else None
+        super().__init__(classifier=classifier,
+                         regressor=regressor,
+                         coder=coder)
+        self.logger = None  # get_logger(log_num_anchors) if log_num_anchors is not None else None
 
-    def compute_loss(self,
-                     prediction: Dict[str, Tensor],
-                     target_labels: List[Tensor],
-                     matched_gt_boxes: List[Tensor],
-                     anchors: List[Tensor],
-                     ) -> Tuple[Dict[str, Tensor], torch.Tensor, Optional[torch.Tensor]]:
+    def compute_loss(
+        self,
+        prediction: Dict[str, Tensor],
+        target_labels: List[Tensor],
+        matched_gt_boxes: List[Tensor],
+        anchors: List[Tensor],
+    ) -> Tuple[Dict[str, Tensor], torch.Tensor, Optional[torch.Tensor]]:
         """
         Compute regression and classification loss
         N anchors over all images; M anchors per image => sum(M) = N
@@ -324,7 +363,8 @@ class BoxHeadNoSampler(DetectionHead):
             Tensor: sampled positive indices of anchors (after concatenation)
             Tensor: sampled negative indices of anchors (after concatenation)
         """
-        box_logits, box_deltas = prediction["box_logits"], prediction["box_deltas"]
+        box_logits, box_deltas = prediction["box_logits"], prediction[
+            "box_deltas"]
 
         target_labels = torch.cat(target_labels, dim=0)
         batch_anchors = torch.cat(anchors, dim=0)
@@ -344,17 +384,19 @@ class BoxHeadNoSampler(DetectionHead):
         losses["cls"] = self.classifier.compute_loss(
             box_logits[sampled_inds],
             target_labels[sampled_inds],
-            ) / max(1, sampled_pos_inds.numel())
+        ) / max(1, sampled_pos_inds.numel())
         return losses, sampled_pos_inds, None
 
 
 class DetectionHeadHNMNative(DetectionHeadHNM):
-    def compute_loss(self,
-                     prediction: Dict[str, Tensor],
-                     target_labels: List[Tensor],
-                     matched_gt_boxes: List[Tensor],
-                     anchors: List[Tensor],
-                     ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
+
+    def compute_loss(
+        self,
+        prediction: Dict[str, Tensor],
+        target_labels: List[Tensor],
+        matched_gt_boxes: List[Tensor],
+        anchors: List[Tensor],
+    ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
         """
         Compute regression and classification loss
         N anchors over all images; M anchors per image => sum(M) = N
@@ -380,25 +422,29 @@ class DetectionHeadHNMNative(DetectionHeadHNM):
             Tensor: sampled positive indices of anchors (after concatenation)
             Tensor: sampled negative indices of anchors (after concatenation)
         """
-        box_logits, box_deltas = prediction["box_logits"], prediction["box_deltas"]
+        box_logits, box_deltas = prediction["box_logits"], prediction[
+            "box_deltas"]
 
         with torch.no_grad():
             losses = {}
-            sampled_pos_inds, sampled_neg_inds = self.select_indices(target_labels, box_logits)
-            sampled_inds = torch.cat([sampled_pos_inds, sampled_neg_inds], dim=0)
+            sampled_pos_inds, sampled_neg_inds = self.select_indices(
+                target_labels, box_logits)
+            sampled_inds = torch.cat([sampled_pos_inds, sampled_neg_inds],
+                                     dim=0)
 
         target_labels = torch.cat(target_labels, dim=0)
         batch_anchors = torch.cat(anchors, dim=0)
         pred_boxes_sampled = self.coder.decode_single(
             box_deltas[sampled_pos_inds], batch_anchors[sampled_pos_inds])
 
-        target_boxes_sampled = torch.cat(matched_gt_boxes, dim=0)[sampled_pos_inds]
+        target_boxes_sampled = torch.cat(matched_gt_boxes,
+                                         dim=0)[sampled_pos_inds]
 
         if sampled_pos_inds.numel() > 0:
             losses["reg"] = self.regressor.compute_loss(
                 pred_boxes_sampled,
                 target_boxes_sampled,
-                ) / max(1, sampled_pos_inds.numel())
+            ) / max(1, sampled_pos_inds.numel())
 
         losses["cls"] = self.classifier.compute_loss(
             box_logits[sampled_inds], target_labels[sampled_inds])
@@ -406,12 +452,14 @@ class DetectionHeadHNMNative(DetectionHeadHNM):
 
 
 class DetectionHeadHNMNativeRegAll(DetectionHeadHNM):
-    def compute_loss(self,
-                     prediction: Dict[str, Tensor],
-                     target_labels: List[Tensor],
-                     matched_gt_boxes: List[Tensor],
-                     anchors: List[Tensor],
-                     ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
+
+    def compute_loss(
+        self,
+        prediction: Dict[str, Tensor],
+        target_labels: List[Tensor],
+        matched_gt_boxes: List[Tensor],
+        anchors: List[Tensor],
+    ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
         """
         Compute regression and classification loss
         N anchors over all images; M anchors per image => sum(M) = N
@@ -437,10 +485,12 @@ class DetectionHeadHNMNativeRegAll(DetectionHeadHNM):
             Tensor: sampled positive indices of anchors (after concatenation)
             Tensor: sampled negative indices of anchors (after concatenation)
         """
-        box_logits, box_deltas = prediction["box_logits"], prediction["box_deltas"]
+        box_logits, box_deltas = prediction["box_logits"], prediction[
+            "box_deltas"]
 
         losses = {}
-        sampled_pos_inds, sampled_neg_inds = self.select_indices(target_labels, box_logits)
+        sampled_pos_inds, sampled_neg_inds = self.select_indices(
+            target_labels, box_logits)
         sampled_inds = torch.cat([sampled_pos_inds, sampled_neg_inds], dim=0)
 
         target_labels = torch.cat(target_labels, dim=0)
@@ -454,25 +504,28 @@ class DetectionHeadHNMNativeRegAll(DetectionHeadHNM):
             box_logits[sampled_inds], target_labels[sampled_inds])
 
         pos_inds = torch.where(target_labels >= 1)[0]
-        pred_boxes = self.coder.decode_single(box_deltas[pos_inds], batch_anchors[pos_inds])
+        pred_boxes = self.coder.decode_single(box_deltas[pos_inds],
+                                              batch_anchors[pos_inds])
         target_boxes = torch.cat(matched_gt_boxes, dim=0)[pos_inds]
 
         if pos_inds.numel() > 0:
             losses["reg"] = self.regressor.compute_loss(
                 pred_boxes,
                 target_boxes,
-                ) / max(1, pos_inds.numel())
+            ) / max(1, pos_inds.numel())
 
         return losses, sampled_pos_inds, sampled_neg_inds
 
 
 class DetectionHeadHNMRegAll(DetectionHeadHNM):
-    def compute_loss(self,
-                     prediction: Dict[str, Tensor],
-                     target_labels: List[Tensor],
-                     matched_gt_boxes: List[Tensor],
-                     anchors: List[Tensor],
-                     ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
+
+    def compute_loss(
+        self,
+        prediction: Dict[str, Tensor],
+        target_labels: List[Tensor],
+        matched_gt_boxes: List[Tensor],
+        anchors: List[Tensor],
+    ) -> Tuple[Dict[str, Tensor], torch.Tensor, torch.Tensor]:
         """
         Compute regression and classification loss
         N anchors over all images; M anchors per image => sum(M) = N
@@ -495,10 +548,12 @@ class DetectionHeadHNMRegAll(DetectionHeadHNM):
             Tensor: sampled positive indices of anchors (after concatenation)
             Tensor: sampled negative indices of anchors (after concatenation)
         """
-        box_logits, box_deltas = prediction["box_logits"], prediction["box_deltas"]
+        box_logits, box_deltas = prediction["box_logits"], prediction[
+            "box_deltas"]
 
         losses = {}
-        sampled_pos_inds, sampled_neg_inds = self.select_indices(target_labels, box_logits)
+        sampled_pos_inds, sampled_neg_inds = self.select_indices(
+            target_labels, box_logits)
         sampled_inds = torch.cat([sampled_pos_inds, sampled_neg_inds], dim=0)
         target_labels = torch.cat(target_labels, dim=0)
 
@@ -510,7 +565,8 @@ class DetectionHeadHNMRegAll(DetectionHeadHNM):
             batch_matched_gt_boxes = torch.cat(matched_gt_boxes, dim=0)
             batch_anchors = torch.cat(anchors, dim=0)
             target_deltas_sampled = self.coder.encode_single(
-                batch_matched_gt_boxes[pos_inds], batch_anchors[pos_inds],
+                batch_matched_gt_boxes[pos_inds],
+                batch_anchors[pos_inds],
             )
 
         assert len(batch_anchors) == len(batch_matched_gt_boxes)
@@ -522,7 +578,7 @@ class DetectionHeadHNMRegAll(DetectionHeadHNM):
             losses["reg"] = self.regressor.compute_loss(
                 box_deltas[pos_inds],
                 target_deltas_sampled,
-                ) / max(1, pos_inds.numel())
+            ) / max(1, pos_inds.numel())
 
         return losses, sampled_pos_inds, sampled_neg_inds
 
